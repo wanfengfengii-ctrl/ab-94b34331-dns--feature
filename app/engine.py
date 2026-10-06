@@ -17,6 +17,16 @@ Rules implemented:
 * The apex always holds exactly one SOA.
 * A failing change — and therefore the whole replay — never produces a partial
   snapshot: each change is applied to a private copy first.
+
+Optional ``snapshot_commitments`` (one ``before_sha256``/``after_sha256`` pair
+per change, lowercase hex) pin the canonical snapshot the publisher saw: the
+current snapshot is checked before each change begins and the candidate
+snapshot after its deletes/adds pass every rule. Digests use the same
+canonical record sequence as the success response's ``sha256``. A mismatch —
+or a malformed commitment — rejects the whole replay with a stable code, the
+1-based change, and the phase (``before``/``after``); the error never carries
+candidate records or digests. When every commitment matches, the response is
+the usual final snapshot plus ``commitments_verified: true``.
 """
 
 from __future__ import annotations
@@ -52,6 +62,7 @@ class ReplayError(Exception):
         *,
         record: int | None = None,
         field: str | None = None,
+        phase: str | None = None,
     ) -> None:
         super().__init__(message or rule)
         self.code = code
@@ -60,6 +71,7 @@ class ReplayError(Exception):
         self.message = message or rule
         self.record = record
         self.field = field
+        self.phase = phase
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -72,6 +84,8 @@ class ReplayError(Exception):
             payload["record"] = self.record
         if self.field is not None:
             payload["field"] = self.field
+        if self.phase is not None:
+            payload["phase"] = self.phase
         return payload
 
 
@@ -325,6 +339,60 @@ def _name_in_zone(name: str, apex: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Snapshot commitments
+# ---------------------------------------------------------------------------
+
+#: A commitment digest is exactly one lowercase-hex SHA-256.
+_COMMITMENT_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _snapshot_commitments(
+    payload: dict[str, Any], changes_count: int
+) -> list[tuple[str, str]] | None:
+    """Validate the optional ``snapshot_commitments`` envelope.
+
+    Returns ``None`` when the field is omitted (legacy behaviour) or a list of
+    ``(before_sha256, after_sha256)`` pairs aligned 1:1 with ``changes``. Any
+    shape/count/format problem raises :class:`ReplayError` locating the
+    offending change (1-based; ``0`` for the array itself) and the phase the
+    malformed digest belongs to.
+    """
+
+    raw = payload.get("snapshot_commitments")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or len(raw) != changes_count:
+        raise ReplayError(
+            "INVALID_SNAPSHOT_COMMITMENT",
+            "commitments_count_must_match_changes",
+            0,
+            phase="before",
+            field="snapshot_commitments",
+        )
+    parsed: list[tuple[str, str]] = []
+    for change_index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise ReplayError(
+                "INVALID_SNAPSHOT_COMMITMENT",
+                "commitment_must_be_object",
+                change_index,
+                phase="before",
+            )
+        for phase, key in (("before", "before_sha256"), ("after", "after_sha256")):
+            value = item.get(key)
+            if not isinstance(value, str) or not _COMMITMENT_HEX_RE.match(value):
+                raise ReplayError(
+                    "INVALID_SNAPSHOT_COMMITMENT",
+                    f"{key}_must_be_lowercase_hex_sha256",
+                    change_index,
+                    phase=phase,
+                    field=key,
+                )
+        parsed.append((item["before_sha256"], item["after_sha256"]))
+    return parsed
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -345,6 +413,7 @@ def replay(payload: Any) -> dict[str, Any]:
             "changes_count_out_of_range",
             field="changes",
         )
+    commitments = _snapshot_commitments(payload, len(changes))
 
     total_records = len(start) + sum(
         len(_records_list(change.get("deletes"), index + 1, "deletes"))
@@ -391,6 +460,18 @@ def replay(payload: Any) -> dict[str, Any]:
 
     # --- Apply changes sequentially, each atomically -----------------------------
     for change_index, raw_change in enumerate(changes, start=1):
+        if commitments is not None:
+            # Before the change begins, both parties must agree on the
+            # current canonical snapshot. The error never carries the
+            # expected or actual digest.
+            expected_before = commitments[change_index - 1][0]
+            if snapshot_digest(zone) != expected_before:
+                raise ReplayError(
+                    "SNAPSHOT_COMMITMENT_MISMATCH",
+                    "before_snapshot_digest_mismatch",
+                    change_index,
+                    phase="before",
+                )
         if not isinstance(raw_change, dict):
             raise ReplayError(
                 "INVALID_CHANGE", "change_must_be_object", change_index
@@ -505,10 +586,26 @@ def replay(payload: Any) -> dict[str, Any]:
                 "SOA_NOT_UNIQUE", "apex_must_have_one_soa", change_index
             )
 
+        if commitments is not None:
+            # All deletes/adds passed the existing rules; the candidate
+            # snapshot must now match the publisher's after-commitment.
+            expected_after = commitments[change_index - 1][1]
+            if snapshot_digest(candidate) != expected_after:
+                raise ReplayError(
+                    "SNAPSHOT_COMMITMENT_MISMATCH",
+                    "after_snapshot_digest_mismatch",
+                    change_index,
+                    phase="after",
+                )
+
         zone = candidate
         current_serial = _soa_serial(zone, apex)
 
-    return build_snapshot(zone, apex, current_serial, len(changes))
+    result = build_snapshot(zone, apex, current_serial, len(changes))
+    if commitments is not None:
+        # Every before/after commitment matched; say so explicitly.
+        result["commitments_verified"] = True
+    return result
 
 
 def _soa_serial(zone: dict[tuple[str, str], RRset], apex: str) -> int:

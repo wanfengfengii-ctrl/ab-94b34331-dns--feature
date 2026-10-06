@@ -14,6 +14,9 @@ change-located error code and **no partial snapshot is ever returned**.
   "start": [ <RR>, ... ],
   "changes": [
     { "deletes": [ <RR>, ... ], "adds": [ <RR>, ... ] }
+  ],
+  "snapshot_commitments": [
+    { "before_sha256": "<64 lowercase hex>", "after_sha256": "<64 lowercase hex>" }
   ]
 }
 ```
@@ -22,6 +25,10 @@ change-located error code and **no partial snapshot is ever returned**.
   contain exactly one SOA.
 * `changes`: **1–64** ordered changes; total records across the request
   (start + every delete/add) must not exceed **5000**.
+* `snapshot_commitments` *(optional)*: exactly one entry per change. Each entry
+  pins the canonical snapshot digest the publisher observed **before** the
+  change began and **after** it applied. When omitted, request, response, and
+  error semantics are unchanged.
 
 Record shape:
 
@@ -50,6 +57,24 @@ Record shape:
 8. Zone and record names are **case-insensitively normalized** (canonical
    lowercase; a single trailing dot is accepted as absolute form).
 
+### Snapshot commitments
+
+When `snapshot_commitments` is present, the replay additionally proves that
+both parties agree on the canonical zone state at every step:
+
+1. **Before** each change begins, the current canonical snapshot digest must
+   equal that entry's `before_sha256` (change 1 therefore pins the start zone,
+   catching a wrong baseline or a tampered log up front).
+2. **After** the change's deletes and adds pass every rule above, the
+   candidate snapshot digest must equal its `after_sha256`.
+
+Digests are computed over the same canonical, stably ordered record sequence
+as the success response's `sha256`. A wrong count, a malformed digest, or any
+mismatch rejects the **entire** replay with `422` and an error carrying a
+stable code, the 1-based `change`, and the `phase` (`"before"` / `"after"`) —
+never any candidate records or digests. When every commitment matches, the
+response is the usual final snapshot plus `"commitments_verified": true`.
+
 ## Response
 
 `200 OK`
@@ -60,9 +85,13 @@ Record shape:
   "final_serial": 1,
   "changes_applied": 3,
   "records": [ { "name": "...", "type": "...", "ttl": 300, ... } ],
-  "sha256": "<sha-256 of the canonical, stably ordered snapshot>"
+  "sha256": "<sha-256 of the canonical, stably ordered snapshot>",
+  "commitments_verified": true
 }
 ```
+
+(`commitments_verified` is present only when `snapshot_commitments` was
+supplied and every entry matched.)
 
 `422 Unprocessable Entity` for an unpublishable log:
 
@@ -80,6 +109,20 @@ Record shape:
 
 `change` is 1-based (`0` denotes the starting zone); `record` locates the
 offending entry within that change's delete/add sequence (0-based).
+Commitment failures add `phase` (`"before"` or `"after"`) and never include
+candidate records or digests:
+
+```json
+{
+  "error": {
+    "code": "SNAPSHOT_COMMITMENT_MISMATCH",
+    "rule": "after_snapshot_digest_mismatch",
+    "change": 2,
+    "message": "after_snapshot_digest_mismatch",
+    "phase": "after"
+  }
+}
+```
 
 ### Stable error codes
 
@@ -98,6 +141,8 @@ offending entry within that change's delete/add sequence (0-based).
 | `TTL_MISMATCH` | RRset members carry different TTLs |
 | `CNAME_CONFLICT` | CNAME coexists with other data |
 | `NAME_OUTSIDE_ZONE` | Record owner is outside the zone apex |
+| `INVALID_SNAPSHOT_COMMITMENT` | Commitment count/shape/format invalid (carries `change` + `phase`) |
+| `SNAPSHOT_COMMITMENT_MISMATCH` | Before/after digest does not match the canonical snapshot (carries `change` + `phase`) |
 
 ## Running with Docker
 
