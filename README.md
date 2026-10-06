@@ -14,6 +14,9 @@ change-located error code and **no partial snapshot is ever returned**.
   "start": [ <RR>, ... ],
   "changes": [
     { "deletes": [ <RR>, ... ], "adds": [ <RR>, ... ] }
+  ],
+  "snapshot_commitments": [
+    { "before_sha256": "<hex64>", "after_sha256": "<hex64>" }
   ]
 }
 ```
@@ -22,6 +25,14 @@ change-located error code and **no partial snapshot is ever returned**.
   contain exactly one SOA.
 * `changes`: **1–64** ordered changes; total records across the request
   (start + every delete/add) must not exceed **5000**.
+* `snapshot_commitments` *(optional)*: when present it must contain **exactly
+  one entry per change**, in order. Each entry carries two lowercase
+  hexadecimal SHA-256 digests. Before a change starts, the current canonical
+  snapshot is compared with `before_sha256`; after every delete/add rule has
+  passed on the private candidate, the candidate snapshot is compared with
+  `after_sha256`. Both digests use the **same canonical record sequence** as
+  the success response's `sha256`. When the field is omitted, the request,
+  response and error semantics are unchanged.
 
 Record shape:
 
@@ -60,9 +71,15 @@ Record shape:
   "final_serial": 1,
   "changes_applied": 3,
   "records": [ { "name": "...", "type": "...", "ttl": 300, ... } ],
-  "sha256": "<sha-256 of the canonical, stably ordered snapshot>"
+  "sha256": "<sha-256 of the canonical, stably ordered snapshot>",
+  "snapshot_commitments_verified": true
 }
 ```
+
+`snapshot_commitments_verified` is present and `true` only when the request
+carried `snapshot_commitments` and every before/after promise matched; the
+field is absent from legacy (commitment-free) responses. The final snapshot
+itself is identical to what a commitment-free replay of the same log returns.
 
 `422 Unprocessable Entity` for an unpublishable log:
 
@@ -98,6 +115,26 @@ offending entry within that change's delete/add sequence (0-based).
 | `TTL_MISMATCH` | RRset members carry different TTLs |
 | `CNAME_CONFLICT` | CNAME coexists with other data |
 | `NAME_OUTSIDE_ZONE` | Record owner is outside the zone apex |
+| `SNAPSHOT_COMMITMENT_INVALID` | A commitment entry or digest is malformed (wrong count, non-object, not lowercase hex64); `field` names `before_sha256`/`after_sha256` |
+| `SNAPSHOT_COMMITMENT_MISMATCH` | A promised digest does not match the canonical snapshot; `stage` is `before` or `after` |
+
+A commitment mismatch is reported with the 1-based `change` and a `stage` of
+`before` (checked as the change starts) or `after` (checked once every
+delete/add rule has passed). To avoid disclosing a tampered or divergent
+baseline, this error never contains candidate records or the locally computed
+digest:
+
+```json
+{
+  "error": {
+    "code": "SNAPSHOT_COMMITMENT_MISMATCH",
+    "rule": "snapshot_commitment_after_mismatch",
+    "change": 2,
+    "stage": "after",
+    "message": "..."
+  }
+}
+```
 
 ## Running with Docker
 

@@ -152,3 +152,135 @@ def test_invalid_record_shapes(record):
     response = client.post("/api/dns/ixfr/replay", json=body)
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "INVALID_RECORD"
+
+
+# ---------------------------------------------------------------------------
+# snapshot_commitments
+# ---------------------------------------------------------------------------
+
+
+def _state_digests(start, changes):
+    """Canonical digest of the start zone and after each change prefix."""
+    from app.engine import _add, normalize_record, snapshot_digest
+
+    zone: dict = {}
+    for index, raw in enumerate(start):
+        _add(zone, normalize_record(raw, 0, index), 0, index)
+    digests = [snapshot_digest(zone)]
+    for prefix in range(1, len(changes) + 1):
+        response = client.post(
+            "/api/dns/ixfr/replay",
+            json={"start": start, "changes": changes[:prefix]},
+        )
+        assert response.status_code == 200, response.text
+        digests.append(response.json()["sha256"])
+    return digests
+
+
+def _commitments(digests):
+    return [
+        {"before_sha256": digests[i], "after_sha256": digests[i + 1]}
+        for i in range(len(digests) - 1)
+    ]
+
+
+def _committed_changes():
+    return [
+        change(SERIAL_MOD - 2, SERIAL_MOD - 1, adds=[rr("mail.example.com", "A", address="192.0.2.20")]),
+        change(SERIAL_MOD - 1, 0),
+        change(0, 1),
+    ]
+
+
+def test_committed_replay_success_is_marked_and_unchanged_otherwise():
+    start, changes = _start(), _committed_changes()
+    commitments = _commitments(_state_digests(start, changes))
+
+    committed = client.post(
+        "/api/dns/ixfr/replay",
+        json={"start": start, "changes": changes, "snapshot_commitments": commitments},
+    )
+    legacy = client.post(
+        "/api/dns/ixfr/replay", json={"start": start, "changes": changes}
+    )
+    assert committed.status_code == 200, committed.text
+    cdata, ldata = committed.json(), legacy.json()
+    assert cdata["snapshot_commitments_verified"] is True
+    assert "snapshot_commitments_verified" not in ldata
+    for key in ("apex", "final_serial", "changes_applied", "records", "sha256"):
+        assert cdata[key] == ldata[key]
+
+
+def test_commitments_count_mismatch_is_422():
+    start, changes = _start(), _committed_changes()
+    commitments = _commitments(_state_digests(start, changes))[:-1]
+    response = client.post(
+        "/api/dns/ixfr/replay",
+        json={"start": start, "changes": changes, "snapshot_commitments": commitments},
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "REQUEST_MALFORMED"
+
+
+def test_commitment_uppercase_digest_rejected_with_change_and_field():
+    start, changes = _start(), _committed_changes()
+    commitments = _commitments(_state_digests(start, changes))
+    commitments[1]["after_sha256"] = commitments[1]["after_sha256"].upper()
+    response = client.post(
+        "/api/dns/ixfr/replay",
+        json={"start": start, "changes": changes, "snapshot_commitments": commitments},
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "SNAPSHOT_COMMITMENT_INVALID"
+    assert error["change"] == 2
+    assert error["field"] == "after_sha256"
+
+
+def test_before_commitment_mismatch_locates_change_and_stage():
+    start, changes = _start(), _committed_changes()
+    commitments = _commitments(_state_digests(start, changes))
+    commitments[0]["before_sha256"] = "0" * 64
+    response = client.post(
+        "/api/dns/ixfr/replay",
+        json={"start": start, "changes": changes, "snapshot_commitments": commitments},
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "SNAPSHOT_COMMITMENT_MISMATCH"
+    assert error["change"] == 1
+    assert error["stage"] == "before"
+
+
+def test_after_commitment_mismatch_locates_change_and_stage():
+    start, changes = _start(), _committed_changes()
+    commitments = _commitments(_state_digests(start, changes))
+    commitments[2]["after_sha256"] = "f" * 64
+    response = client.post(
+        "/api/dns/ixfr/replay",
+        json={"start": start, "changes": changes, "snapshot_commitments": commitments},
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "SNAPSHOT_COMMITMENT_MISMATCH"
+    assert error["change"] == 3
+    assert error["stage"] == "after"
+
+
+def test_commitment_mismatch_never_leaks_records_or_digests():
+    start, changes = _start(), _committed_changes()
+    digests = _state_digests(start, changes)
+    commitments = _commitments(digests)
+    real_before = commitments[0]["before_sha256"]
+    commitments[0]["before_sha256"] = "0" * 64
+    response = client.post(
+        "/api/dns/ixfr/replay",
+        json={"start": start, "changes": changes, "snapshot_commitments": commitments},
+    )
+    assert response.status_code == 422
+    raw = response.text
+    assert "records" not in response.json()
+    assert "sha256" not in response.json().get("error", {})
+    assert real_before not in raw
+    assert "192.0.2.20" not in raw

@@ -20,6 +20,10 @@ import sys
 import urllib.error
 import urllib.request
 
+# Make the bundled engine importable whether run as ``python scripts/smoke.py``
+# from the repository root or from /srv inside the container.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 BASE_URL = os.environ.get("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 WRAP = 1 << 32
 
@@ -112,6 +116,123 @@ def main() -> int:
     # Replaying the identical payload yields the identical digest.
     status, body2 = request("POST", "/api/dns/ixfr/replay", payload)
     check("digest is deterministic", status == 200 and body2.get("sha256") == digest)
+
+    # --- Committed replay: publisher pins before/after snapshot digests -----
+    # The promised digests use the same canonical record sequence as the
+    # success response sha256; derive them with the engine's own digest helper
+    # and by replaying each change prefix over HTTP.
+    from app.engine import _add, normalize_record, snapshot_digest
+
+    start_zone: dict = {}
+    for index, raw in enumerate(start):
+        _add(start_zone, normalize_record(raw, 0, index), 0, index)
+    states = [snapshot_digest(start_zone)]
+    for prefix in range(1, len(payload["changes"]) + 1):
+        status, staged = request(
+            "POST",
+            "/api/dns/ixfr/replay",
+            {"start": start, "changes": payload["changes"][:prefix]},
+        )
+        check(f"prefix replay {prefix} succeeds", status == 200, str(staged))
+        states.append(staged["sha256"])
+
+    commitments = [
+        {"before_sha256": states[i], "after_sha256": states[i + 1]}
+        for i in range(len(states) - 1)
+    ]
+    status, committed = request(
+        "POST",
+        "/api/dns/ixfr/replay",
+        {**payload, "snapshot_commitments": commitments},
+    )
+    check("committed replay returns 200", status == 200, str(committed))
+    check(
+        "commitments explicitly marked verified",
+        committed.get("snapshot_commitments_verified") is True,
+        str(committed.keys()),
+    )
+    check(
+        "committed replay keeps original final snapshot",
+        committed.get("sha256") == digest
+        and committed.get("records") == body.get("records")
+        and committed.get("final_serial") == 1
+        and committed.get("changes_applied") == 3,
+    )
+
+    # --- Committed replay: a wrong before digest is pinpointed --------------
+    bad_commitments = [dict(item) for item in commitments]
+    real_before = bad_commitments[0]["before_sha256"]
+    bad_commitments[0]["before_sha256"] = "0" * 64
+    status, rejected = request(
+        "POST",
+        "/api/dns/ixfr/replay",
+        {**payload, "snapshot_commitments": bad_commitments},
+    )
+    error = rejected.get("error", {})
+    check("before mismatch rejected with 422", status == 422, str(rejected))
+    check(
+        "before mismatch code/change/stage",
+        error.get("code") == "SNAPSHOT_COMMITMENT_MISMATCH"
+        and error.get("change") == 1
+        and error.get("stage") == "before",
+        str(error),
+    )
+    check(
+        "before mismatch leaks no records or digests",
+        "records" not in rejected
+        and "sha256" not in error
+        and real_before not in json.dumps(rejected),
+        str(rejected),
+    )
+
+    # --- Committed replay: a wrong after digest on change 2 -----------------
+    bad_commitments = [dict(item) for item in commitments]
+    bad_commitments[1]["after_sha256"] = "f" * 64
+    status, rejected = request(
+        "POST",
+        "/api/dns/ixfr/replay",
+        {**payload, "snapshot_commitments": bad_commitments},
+    )
+    error = rejected.get("error", {})
+    check("after mismatch rejected with 422", status == 422, str(rejected))
+    check(
+        "after mismatch code/change/stage",
+        error.get("code") == "SNAPSHOT_COMMITMENT_MISMATCH"
+        and error.get("change") == 2
+        and error.get("stage") == "after",
+        str(error),
+    )
+
+    # --- Commitment envelope must line up 1:1 with changes ------------------
+    status, rejected = request(
+        "POST",
+        "/api/dns/ixfr/replay",
+        {**payload, "snapshot_commitments": commitments[:-1]},
+    )
+    check(
+        "commitment count mismatch rejected",
+        status == 422
+        and rejected.get("error", {}).get("code") == "REQUEST_MALFORMED",
+        str(rejected),
+    )
+
+    # Uppercase hex is not a legal lowercase commitment digest.
+    bad_format = [dict(item) for item in commitments]
+    bad_format[0]["before_sha256"] = bad_format[0]["before_sha256"].upper()
+    status, rejected = request(
+        "POST",
+        "/api/dns/ixfr/replay",
+        {**payload, "snapshot_commitments": bad_format},
+    )
+    error = rejected.get("error", {})
+    check(
+        "uppercase commitment digest rejected",
+        status == 422
+        and error.get("code") == "SNAPSHOT_COMMITMENT_INVALID"
+        and error.get("change") == 1
+        and error.get("field") == "before_sha256",
+        str(rejected),
+    )
 
     # --- Illegal log: serial does not advance in change 2 -------------------
     bad = {
